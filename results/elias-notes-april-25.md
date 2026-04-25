@@ -23,3 +23,11 @@ We should try and veryfy these claims:
  - Does the whole cache get evicted with the GC runs? Is there a difference here between the two machines?
  - How much of the cache is evicted for simply one memory load of pointer chasing? and what parameters could affect how much of the cache is evicted?
  - Are lockfree hashmaps inherently bad for machines with fewer cores or are there other lockfree implementations we could try out that show a different trend?
+
+ # Suggestions of other lockfree implementations
+ - Cliff Click's NonBlockingHashMap / JCTools NonBlockingHashMap: 
+    This hashmap is implementated via one giant array. Everywrite mutate a cell using CAS, and doesn't requires any reallocation except when the array grows and has to resize.
+    It could create hot key contention when running a zipfian distrubution of read/writes -> pontentially many CAS retries.
+ -  Split ordered linked lists
+    A giant linked list of immutable nodes and an array of shortcuts into the list. Uses CAS to replace nodes. Avoids rebuilding the tree and reallocation biggers parts of the tree. There is still a big load on the cache through pointer chasing through the tree.
+ - Changing the width of the Cnode array from 6 to 4 (or maybe even 2?). This result in a taller tree, but every allocation takes less memory (16 slots instead of 64) which might perform better on the RPI. NOTE: why?
