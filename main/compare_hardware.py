@@ -4,24 +4,26 @@ compare_hardware.py — All paper figures for cross-platform HashMap study.
 Generates exactly 4 figures, each answering one research question:
 
   Fig 1 — performance_overview.png
-      Q: Do the same implementations win on both platforms, and by how much?
-      Side-by-side heatmaps (RPi | HPC): impl × 9 workload groups.
-      Reader sees absolute throughput AND whether rankings are preserved.
+      Q: Do the same implementations win on both platforms, and does rank
+         change depending on workload distribution?
+      Slope (bump) chart: 3 panels (one per distribution). Each panel shows
+      RPi rank on the left axis and HPC rank on the right. A crossing line
+      means the implementation's rank changed across hardware tiers.
 
   Fig 2 — scalability.png
       Q: Do implementations scale differently across hardware tiers?
          Where does the memory bandwidth plateau appear on each platform?
-      2×4 grid, one subplot per implementation, both platforms overlaid.
+      2-panel plot, both platforms overlaid per implementation.
 
   Fig 3 — hardware_advantage.png
       Q: How much faster is HPC than RPi, and does it depend on implementation
          or thread count?
-      log₂(HPC/RPi) heatmap: impl × common thread counts.
+      log2(HPC/RPi) heatmap: impl x common thread counts.
 
   Fig 4 — distribution_sensitivity.png
       Q: Does Zipfian skew hurt more on RPi (small 2 MB L3) than on HPC,
          as predicted by the memory bandwidth and cache capacity analysis?
-      Per-platform throughput drop: uniform → zipfian_0.99.
+      Per-platform throughput drop: uniform -> zipfian_0.99.
 
 Usage:
     python3 compare_hardware.py results/raspberrypi-2026-03-27_18-16-22 \\
@@ -55,6 +57,17 @@ MAP_SHORT = {
 
 HPC_COLOR, RPI_COLOR = "#4C72B0", "#DD8452"
 
+IMPL_COLORS = {
+    "SynchronizedMap":       "#e41a1c",
+    "StripedMap":            "#ff7f00",
+    "StripedMapPadded":      "#fdbf6f",
+    "StripedWriteMap":       "#33a02c",
+    "StripedWriteMapPadded": "#b2df8a",
+    "StripedLevelWriteMap":  "#1f78b4",
+    "HashTrieMap":           "#6a3d9a",
+    "WrapConcurrentHashMap": "#b15928",
+}
+
 plt.rcParams.update({
     "figure.dpi":        150,
     "axes.spines.top":   False,
@@ -65,7 +78,7 @@ plt.rcParams.update({
 })
 
 
-# ── Data loading ───────────────────────────────────────────────────────────────
+# -- Data loading --------------------------------------------------------------
 
 def _normalise_cols(df):
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
@@ -113,7 +126,7 @@ def detect_label(folder):
     if "raspberry" in name or "rpi" in name:
         return "RPi 5"
     if "spark" in name:
-        return f"HPC"
+        return "HPC"
     return os.path.basename(folder)
 
 
@@ -142,150 +155,83 @@ def filt(df, threads=None, dist=None, kr=None, ratio=None):
 def short(m): return MAP_SHORT.get(m, m)
 
 
-def workload_matrix(df, t_snap, dists, ratios):
-    """
-    Build (n_maps × n_cols) matrix where cols = (dist × ratio),
-    values = median throughput across key ranges.
-    Returns matrix and sorted map list (by median, descending).
-    """
-    maps = [m for m in MAP_ORDER if m in df["maptype"].values]
-    cols = [(d, r) for d in dists for r in ratios]
-    krs  = sorted(df["keyrange"].unique())
-
-    matrix = np.zeros((len(maps), len(cols)))
-    for j, (dist, ratio) in enumerate(cols):
-        for i, m in enumerate(maps):
-            scores = []
-            for kr in krs:
-                row = filt(df, t_snap, dist, kr, ratio)
-                row = row[row["maptype"] == m]
-                if not row.empty and row["score"].values[0] > 0:
-                    scores.append(row["score"].values[0])
-            matrix[i, j] = np.median(scores) if scores else 0
-
-    order    = np.argsort(np.median(matrix, axis=1))[::-1]
-    maps_s   = [maps[i] for i in order]
-    matrix_s = matrix[order, :]
-    return maps_s, matrix_s, cols
-
-
-# ── Figure 1: Performance overview ────────────────────────────────────────────
+# -- Figure 1: Slope chart (rank stability) ------------------------------------
 #
-# Two heatmaps side by side (RPi | HPC).
-# Rows: implementations sorted by HPC median (so the same ordering is used
-#       on both panels — ranking shifts immediately visible as row reorderings).
-# Columns: 9 workload groups (3 distributions × 3 read ratios, median over
-#          key ranges).
-# Color: normalized PER COLUMN within each platform so relative rankings
-#        within each workload condition are readable.
-# Annotation: actual ops/μs so absolute numbers are not hidden.
+# Three panels side by side, one per distribution.
+# Within each panel: left axis = RPi rank, right axis = HPC rank.
+# Each implementation is a labelled line connecting its rank on both sides.
+# A line that crosses others means that implementation's rank changed.
+# Rank 1 = highest throughput, plotted at the top.
 #
-# This single figure answers: do the same implementations win on both
-# platforms? Do rankings shift under different workload conditions?
-# It also shows the absolute throughput gap between platforms without
-# requiring a separate figure.
+# This directly answers: do rankings hold across hardware, and does the
+# answer depend on workload distribution? HashTrie's rank shift under
+# high Zipfian skew is immediately visible as an intersecting line.
 
 def plot_performance_overview(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
-    dists  = [d for d in ["uniform", "zipfian_0.5", "zipfian_0.99"]
-              if d in hpc["distribution"].values and d in rpi["distribution"].values]
-    ratios = sorted(
-        set(hpc["readratio"].unique()) & set(rpi["readratio"].unique()),
-        reverse=True
-    )
-
+    dist  = "zipfian_0.99"
     t_hpc = hpc["threads"].max()
     t_rpi = rpi["threads"].max()
 
-    # Sort order fixed to HPC median so ranking shifts are readable
-    maps_hpc, mat_hpc, cols = workload_matrix(hpc, t_hpc, dists, ratios)
-    maps_rpi, mat_rpi, _    = workload_matrix(rpi, t_rpi, dists, ratios)
+    if dist not in hpc["distribution"].values or dist not in rpi["distribution"].values:
+        print("  Skipping performance overview: zipfian_0.99 not found in data.")
+        return
 
-    # Re-order RPi rows to match HPC order
-    rpi_maps_base = [m for m in MAP_ORDER if m in rpi["maptype"].values]
-    rpi_order_map = {m: i for i, m in enumerate(rpi_maps_base)}
-    rpi_reorder   = [rpi_order_map[m] for m in maps_hpc if m in rpi_order_map]
+    maps = [m for m in MAP_ORDER
+            if m in hpc["maptype"].values and m in rpi["maptype"].values]
+    n = len(maps)
 
-    # Build RPi matrix in HPC row order
-    _, mat_rpi_raw, _ = workload_matrix(rpi, t_rpi, dists, ratios)
-    # We need to re-map: maps_rpi sorted order → HPC order
-    rpi_maps_sorted_idx = {m: i for i, m in enumerate(maps_rpi)}
-    mat_rpi_reordered = np.zeros_like(mat_hpc)
-    for i, m in enumerate(maps_hpc):
-        if m in rpi_maps_sorted_idx:
-            mat_rpi_reordered[i, :] = mat_rpi[rpi_maps_sorted_idx[m], :]
+    def get_ranks(df, t_snap):
+        scores = {}
+        for m in maps:
+            vals = df[(df["threads"] == t_snap) &
+                      (df["distribution"] == dist) &
+                      (df["maptype"] == m)]["score"]
+            scores[m] = vals.median() if not vals.empty else 0
+        sorted_maps = sorted(scores, key=scores.get, reverse=True)
+        return {m: sorted_maps.index(m) + 1 for m in maps}
 
-    fig, axes = plt.subplots(1, 2, figsize=(20, 7))
+    rpi_ranks = get_ranks(rpi, t_rpi)
+    hpc_ranks = get_ranks(hpc, t_hpc)
 
-    n_ratio = len(ratios)
-    n_cols  = len(cols)
+    fig, ax = plt.subplots(figsize=(6, 6))
 
-    for ax, matrix, panel_label, t_snap in [
-        (axes[0], mat_rpi_reordered, lbl_rpi, t_rpi),
-        (axes[1], mat_hpc,           lbl_hpc, t_hpc),
-    ]:
-        col_max = matrix.max(axis=0, keepdims=True)
-        col_max[col_max == 0] = 1
-        matrix_n = matrix / col_max
+    for m in maps:
+        r_rpi = rpi_ranks[m]
+        r_hpc = hpc_ranks[m]
+        color = IMPL_COLORS.get(m, "gray")
+        lw    = 2.5 if m == "HashTrieMap" else 1.5
+        ax.plot([0, 1], [r_rpi, r_hpc], color=color,
+                linewidth=lw, solid_capstyle="round")
+        ax.scatter([0, 1], [r_rpi, r_hpc], color=color, s=50, zorder=5)
+        ax.text(-0.06, r_rpi, short(m), ha="right", va="center",
+                fontsize=9, color=color)
+        ax.text(1.06, r_hpc, short(m), ha="left", va="center",
+                fontsize=9, color=color)
 
-        im = ax.imshow(matrix_n, cmap="YlOrRd", aspect="auto", vmin=0, vmax=1)
-
-        for i in range(len(maps_hpc)):
-            for j in range(n_cols):
-                v = matrix[i, j]
-                if v == 0:
-                    continue
-                fmt = f"{v:.2f}" if v < 10 else f"{v:.0f}"
-                ax.text(j, i, fmt, ha="center", va="center", fontsize=7,
-                        color="white" if matrix_n[i, j] > 0.65 else "black")
-
-        # Read-ratio tick labels
-        ax.set_xticks(range(n_cols))
-        ax.set_xticklabels([f"{int(r*100)}% reads" for _, r in cols],
-                           fontsize=7.5, rotation=45, ha="right")
-
-        # Distribution group headers, placed just below the tick labels
-        for k, dist in enumerate(dists):
-            center_frac = (k * n_ratio + (n_ratio - 1) / 2 + 0.5) / n_cols
-            ax.text(center_frac, -0.22, dist.replace("zipfian_", "Zipf-"),
-                    ha="center", va="top", fontsize=9, fontweight="bold",
-                    transform=ax.transAxes)
-            if k > 0:
-                ax.axvline(k * n_ratio - 0.5, color="white", linewidth=2)
-
-        ax.set_yticks(range(len(maps_hpc)))
-        ax.set_yticklabels(
-            [short(m) for m in maps_hpc] if ax == axes[0] else [""] * len(maps_hpc),
-            fontsize=9
-        )
-        ax.set_title(f"{panel_label}  (peak: {t_snap} threads)",
-                     fontsize=11, fontweight="bold", pad=8)
-
-        cbar = plt.colorbar(im, ax=ax, fraction=0.025, pad=0.03)
-        cbar.set_label("Relative rank within workload\n(1.0 = fastest in that column)",
-                       fontsize=8)
-
-    fig.suptitle(
-        "Median throughput (ops/μs) at peak thread count — colour normalized per workload column\n"
-        "Row order fixed to HPC ranking; if a row shifts position between panels, that implementation's rank changed across hardware.",
+    ax.set_xlim(-0.5, 1.5)
+    ax.set_ylim(n + 0.5, 0.5)
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(
+        [f"{lbl_rpi}\n(t={t_rpi})", f"{lbl_hpc}\n(t={t_hpc})"],
         fontsize=11, fontweight="bold"
     )
-    plt.tight_layout(rect=[0, 0.10, 1, 0.92])
+    ax.yaxis.set_visible(False)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.grid(False)
+    for rank in range(1, n + 1):
+        ax.axhline(rank, color="gray", linewidth=0.4, linestyle="--", alpha=0.4)
+
+    fig.suptitle(
+        "Implementation rank by platform — Zipfian-0.99, peak thread count\n"
+        "Rank 1 = highest throughput. A crossing line indicates rank changed across hardware.",
+        fontsize=11, fontweight="bold"
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.91])
     save_fig(fig, save_dir, "fig1_performance_overview.png", tight=False)
 
 
 # ── Figure 2: Scalability ──────────────────────────────────────────────────────
-#
-# 2×4 grid, one subplot per implementation.
-# Both platforms overlaid on the same axes using ABSOLUTE throughput.
-# Scores aggregated as median across all 18 workload configs.
-#
-# This encodes three things per subplot simultaneously:
-#   • Vertical gap between lines = absolute throughput advantage of HPC
-#   • Shape of each line = scaling behavior on that architecture
-#   • Where each line flattens = memory bandwidth / contention saturation point
-#
-# The bandwidth plateau hypothesis (Chen et al. §2.2 of the paper) is directly
-# testable here: RPi lines should plateau earlier and at a lower thread count.
 
 def plot_scalability(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
     maps = [m for m in MAP_ORDER
@@ -300,71 +246,118 @@ def plot_scalability(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
                 scores.append(vals.median())
         return ts, scores
 
-    all_t = sorted(set(hpc["threads"].unique()) | set(rpi["threads"].unique()))
-    log_x = len(all_t) > 2 and max(all_t) / min(all_t) >= 8
+    colors  = plt.cm.tab10(np.linspace(0, 0.9, len(maps)))
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
 
-    fig, axes = plt.subplots(2, 4, figsize=(17, 8))
-    axes_flat = axes.flatten()
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
 
-    for idx, m in enumerate(maps):
-        ax = axes_flat[idx]
-        for df, color, label, ls in [
-            (hpc, HPC_COLOR, lbl_hpc, "-"),
-            (rpi, RPI_COLOR, lbl_rpi, "--"),
-        ]:
+    for ax, (df, platform_label) in zip(axes, [(rpi, lbl_rpi), (hpc, lbl_hpc)]):
+        plat_t = sorted(df["threads"].unique())
+        log_x  = len(plat_t) > 2 and max(plat_t) / min(plat_t) >= 8
+
+        for idx, m in enumerate(maps):
             ts, scores = median_by_thread(df, m)
-            if scores:
-                ax.plot(ts, scores, label=label, color=color,
-                        linestyle=ls, marker="o", linewidth=1.8, markersize=4)
+            if not scores:
+                continue
+            ax.plot(ts, scores, label=short(m),
+                    color=colors[idx], marker=markers[idx % len(markers)],
+                    linewidth=1.8, markersize=5)
 
-        ax.set_title(short(m), fontsize=10, fontweight="bold")
+        ax.set_title(platform_label, fontsize=12, fontweight="bold", pad=8)
+        ax.set_xlabel("Thread count", fontsize=9)
+        if ax == axes[0]:
+            ax.set_ylabel("Throughput (ops/μs)", fontsize=9)
+
         if log_x:
             ax.set_xscale("log", base=2)
             ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
-            ax.set_xticks(all_t)
-            ax.tick_params(axis="x", labelsize=8, rotation=45)
-        if idx % 4 == 0:
-            ax.set_ylabel("Throughput (ops/μs)", fontsize=8)
-        if idx >= 4:
-            ax.set_xlabel("Thread count", fontsize=8)
+            ax.set_xticks(plat_t)
+            ax.tick_params(axis="x", labelsize=9)
 
-    for i in range(len(maps), len(axes_flat)):
-        axes_flat[i].set_visible(False)
-
-    t_hpc_max = hpc["threads"].max()
-    t_rpi_max = rpi["threads"].max()
-    hpc_h = mlines.Line2D([], [], color=HPC_COLOR, linestyle="-",
-                           marker="o", markersize=4,
-                           label=f"{lbl_hpc}  (1–{t_hpc_max} threads)")
-    rpi_h = mlines.Line2D([], [], color=RPI_COLOR, linestyle="--",
-                           marker="o", markersize=4,
-                           label=f"{lbl_rpi}  (1–{t_rpi_max} threads)")
-    fig.legend(handles=[hpc_h, rpi_h], loc="lower center", ncol=2,
-               bbox_to_anchor=(0.5, 0.01), frameon=True, fontsize=10)
+    handles, labels = axes[1].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="center right", bbox_to_anchor=(1.01, 0.5),
+               fontsize=9, frameon=True, title="Implementation", title_fontsize=9)
 
     fig.suptitle(
-        "Thread-count scaling — median throughput across all 18 workload configurations\n"
-        "A flattening curve signals memory-bandwidth or contention saturation; "
-        "vertical gap between curves = absolute HPC advantage at that thread count.",
+        "Thread-count scaling — median throughput (ops/μs) across all 18 workload configurations\n"
+        "Shared y-axis: vertical distance between panels = absolute hardware gap. "
+        "A flattening curve = bandwidth or contention saturation.",
         fontsize=11, fontweight="bold"
     )
-    plt.tight_layout(rect=[0, 0.07, 1, 0.91])
+    plt.tight_layout(rect=[0, 0, 0.86, 0.90])
     save_fig(fig, save_dir, "fig2_scalability.png")
 
 
-# ── Figure 3: Hardware advantage heatmap ──────────────────────────────────────
+# -- Figure 5: Read ratio sensitivity ------------------------------------------
 #
-# Rows: implementations. Columns: thread counts common to both platforms.
-# Color: log₂(HPC/RPi), median across all 18 workload configs.
-# Cell annotation: human-readable multiplier (e.g. "4.2×").
+# Tests whether write-optimized variants (StripedWriteMap, StripedWriteMapPadded,
+# StripedLevelWriteMap) show a distinctive advantage under read-heavy workloads
+# relative to other implementations.
 #
-# log₂ scale is essential: 4× and 0.25× are symmetric at ±2, so the colormap
-# is honest. Blue = HPC faster, red = RPi faster (unexpected — would suggest
-# the RPi's simpler memory hierarchy benefits that implementation).
+# For each implementation: throughput at read ratios 0.2, 0.5, 0.8 at peak
+# thread count, median across key ranges and distributions.
+# Two panels: RPi 5 and HPC.
 #
-# This figure answers: is the hardware gap uniform across implementations and
-# thread counts, or do some implementations close the gap at high thread counts
-# (suggesting contention dominates over raw compute on the HPC side)?
+# If WriteMap variants show a steeper positive slope from 0.2 to 0.8 than
+# StripedMap, the unsynchronized read path is providing a measurable benefit.
+# If the slope is similar, the write lock dominates even at 80% reads.
+
+def plot_read_ratio_sensitivity(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
+    maps = [m for m in MAP_ORDER
+            if m in hpc["maptype"].values or m in rpi["maptype"].values]
+
+    ratios = sorted(set(hpc["readratio"].unique()) & set(rpi["readratio"].unique()))
+    if not ratios:
+        print("  Skipping read ratio sensitivity: no common read ratios.")
+        return
+
+    colors  = plt.cm.tab10(np.linspace(0, 0.9, len(maps)))
+    markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=False)
+
+    for ax, (df, platform_label) in zip(axes, [(rpi, lbl_rpi), (hpc, lbl_hpc)]):
+        t_peak = df["threads"].max()
+        dists  = df["distribution"].unique()
+        krs    = df["keyrange"].unique()
+
+        for idx, m in enumerate(maps):
+            y = []
+            for r in ratios:
+                vals = []
+                for dist in dists:
+                    for kr in krs:
+                        row = filt(df, t_peak, dist, kr, r)
+                        row = row[row["maptype"] == m]
+                        if not row.empty and row["score"].values[0] > 0:
+                            vals.append(row["score"].values[0])
+                y.append(np.median(vals) if vals else np.nan)
+
+            ax.plot(ratios, y, label=short(m),
+                    color=colors[idx], marker=markers[idx % len(markers)],
+                    linewidth=1.8, markersize=6)
+
+        ax.set_title(platform_label, fontsize=12, fontweight="bold", pad=8)
+        ax.set_xlabel("Read ratio", fontsize=9)
+        ax.set_xticks(ratios)
+        ax.set_xticklabels([str(r) for r in ratios], fontsize=9)
+        if ax == axes[0]:
+            ax.set_ylabel("Throughput (ops/μs)", fontsize=9)
+
+    handles, labels = axes[1].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="center right", bbox_to_anchor=(1.01, 0.5),
+               fontsize=9, frameon=True, title="Implementation", title_fontsize=9)
+
+    fig.suptitle(
+        "Throughput by read ratio — median across distributions and key ranges, peak thread count\n"
+        "A steeper slope for WriteMap variants indicates the unsynchronized read path provides benefit.",
+        fontsize=11, fontweight="bold"
+    )
+    plt.tight_layout(rect=[0, 0, 0.86, 0.90])
+    save_fig(fig, save_dir, "fig5_read_ratio.png")
+
+
+# -- Figure 3: Hardware advantage heatmap -------------------------------------
 
 def plot_hardware_advantage(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
     common_t = sorted(
@@ -437,22 +430,7 @@ def plot_hardware_advantage(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
     save_fig(fig, save_dir, "fig3_hardware_advantage.png")
 
 
-# ── Figure 4: Distribution sensitivity ────────────────────────────────────────
-#
-# Tests the Zipfian hypothesis from §2.2 of the paper:
-#   "With a highly-skewed Zipfian distribution... the degradation on RPi is
-#    likely to be more significant than Chen et al. observed."
-#
-# For each implementation: throughput drop (%) when moving from uniform to
-# zipfian_0.99, at each platform's peak thread count.
-# Positive = skew hurts, negative = cache locality from hot keys actually helps.
-# Aggregated as median across key ranges and read ratios.
-#
-# If RPi bars are consistently taller than HPC bars: hypothesis confirmed —
-# the 2MB L3 is too small to hold hot keys, adding cache misses on top of
-# synchronization costs exactly as predicted.
-# Key range is shown separately (1K vs 1M) because the effect of the RPi's
-# small L3 is most visible at 1M keys where the working set cannot fit.
+# -- Figure 4: Distribution sensitivity ---------------------------------------
 
 def plot_distribution_sensitivity(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
     for df in [hpc, rpi]:
@@ -467,8 +445,6 @@ def plot_distribution_sensitivity(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
     common_krs    = sorted(set(hpc["keyrange"].unique()) & set(rpi["keyrange"].unique()))
     common_ratios = sorted(set(hpc["readratio"].unique()) & set(rpi["readratio"].unique()))
 
-    # Two subplots: one per key range
-    # The L3 hypothesis is most testable at 1M keys (working set exceeds RPi L3)
     fig, axes = plt.subplots(1, len(common_krs), figsize=(8.5 * len(common_krs), 6.5),
                              sharey=True)
     if len(common_krs) == 1:
@@ -508,9 +484,11 @@ def plot_distribution_sensitivity(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
 
         ax.axhline(0, color="black", linewidth=0.8)
         ax.set_xticks(x + w / 2)
-        ax.set_xticklabels([short(m) for m in maps], fontsize=9, rotation=20, ha="right")
+        ax.set_xticklabels([short(m) for m in maps], fontsize=9,
+                           rotation=20, ha="right")
         kr_cache = "fits in RPi L3 (2 MB)" if kr == 1000 else "exceeds RPi L3 (2 MB)"
-        ax.set_title(f"{kr:,} keys  —  {kr_cache}", fontsize=11, fontweight="bold", pad=8)
+        ax.set_title(f"{kr:,} keys  —  {kr_cache}", fontsize=11,
+                     fontweight="bold", pad=8)
         ax.legend(fontsize=9, loc="upper left")
         if ax == axes[0]:
             ax.set_ylabel(
@@ -520,16 +498,14 @@ def plot_distribution_sensitivity(hpc, rpi, lbl_hpc, lbl_rpi, save_dir):
             )
 
     fig.suptitle(
-        "Impact of Zipfian-0.99 key skew relative to uniform access — peak thread count\n"
-        "Prediction: RPi bars are taller (more degradation) because its 2 MB L3 cannot\n"
-        "keep hot keys warm, adding cache misses on top of lock-contention costs.",
+        "Impact of Zipfian-0.99 key skew relative to uniform access — peak thread count",
         fontsize=11, fontweight="bold"
     )
     plt.tight_layout(rect=[0, 0, 1, 0.88])
     save_fig(fig, save_dir, "fig4_distribution_sensitivity.png")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# -- Main ---------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -542,14 +518,13 @@ def main():
     label_a = detect_label(args.folder_a)
     label_b = detect_label(args.folder_b)
 
-    print(f"Loading {label_a}  ← {args.folder_a}")
+    print(f"Loading {label_a}  <- {args.folder_a}")
     df_a = load_folder(args.folder_a)
-    print(f"Loading {label_b}  ← {args.folder_b}\n")
+    print(f"Loading {label_b}  <- {args.folder_b}\n")
     df_b = load_folder(args.folder_b)
 
-    # HPC = platform with more thread counts
     if df_a["threads"].max() < df_b["threads"].max():
-        df_a, df_b     = df_b, df_a
+        df_a, df_b       = df_b, df_a
         label_a, label_b = label_b, label_a
     lbl_hpc, lbl_rpi = label_a, label_b
 
@@ -561,7 +536,7 @@ def main():
     print(f"RPi threads : {sorted(df_b['threads'].unique())}")
     print(f"Common t    : {sorted(set(df_a['threads'].unique()) & set(df_b['threads'].unique()))}\n")
 
-    print("Figure 1: Performance overview ...")
+    print("Figure 1: Performance overview (slope chart) ...")
     plot_performance_overview(df_a, df_b, lbl_hpc, lbl_rpi, save_dir)
 
     print("Figure 2: Scalability ...")
@@ -573,7 +548,10 @@ def main():
     print("Figure 4: Distribution sensitivity ...")
     plot_distribution_sensitivity(df_a, df_b, lbl_hpc, lbl_rpi, save_dir)
 
-    print("\nDone! 4 figures generated.")
+    print("Figure 5: Read ratio sensitivity ...")
+    plot_read_ratio_sensitivity(df_a, df_b, lbl_hpc, lbl_rpi, save_dir)
+
+    print("\nDone! 5 figures generated.")
 
 if __name__ == "__main__":
     main()
