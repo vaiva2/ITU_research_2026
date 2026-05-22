@@ -22,10 +22,10 @@
 
 **Why this matters:**
 - Concurrent data structure research has historically targeted high-end hardware: multi-socket x86 servers, Apple Silicon M-series chips.
-  - Key prior work: Prokopec et al. (Ctrie design), Chen et al. (lock-free map studies), Sestoft's own hash map benchmarks.
+  - Key prior work: Chen et al. (lock-free map studies), Sestoft's own hash map benchmarks.
 - A growing class of real-world deployments runs on hardware with far fewer resources: IoT sensors, wearable health monitors, bedside medical diagnostics, edge inference nodes.
   - These are ARM-based, often quad-core or fewer, with small last-level caches and modest memory bandwidth.
-- **The gap**: nobody has systematically tested whether the performance ordering established on high-end hardware still holds when the hardware budget drops dramatically, or when the ISA shifts from x86 to ARM.
+- **The gap**: few, if any, have systematically tested whether the performance ordering established on high-end hardware still holds when the hardware budget drops dramatically, or when the ISA shifts from x86 to ARM.
 
 **Our research question in one sentence:**
 > Does the performance hierarchy of concurrent hash map implementations transfer from high-end to resource-constrained ARM hardware?
