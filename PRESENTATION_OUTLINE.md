@@ -26,6 +26,7 @@
 - A growing class of real-world deployments runs on hardware with far fewer resources: IoT sensors, wearable health monitors, bedside medical diagnostics, edge inference nodes.
   - These are ARM-based, often quad-core or fewer, with small last-level caches and modest memory bandwidth.
 - **The gap**: few, if any, have systematically tested whether the performance ordering established on high-end hardware still holds when the hardware budget drops dramatically, or when the ISA shifts from x86 to ARM.
+NOTE: discuss peter sestoft's work, as well as chen et al as needed.
 
 **Our research question in one sentence:**
 > Does the performance hierarchy of concurrent hash map implementations transfer from high-end to resource-constrained ARM hardware?
@@ -44,21 +45,18 @@
 
 | Property | Raspberry Pi 5 | NVIDIA DGX Spark (HPC node) |
 |---|---|---|
-| Architecture | ARM Cortex-A76 (aarch64) | NVIDIA Grace (aarch64) |
-| Physical cores | 4 | 72 |
-| Clock speed | ~2.4 GHz | ~4.0 GHz |
-| L3 cache | 2 MB | ~114 MB |
-| DRAM | 8 GB LPDDR4X | 480 GB LPDDR5X |
+| Architecture | ARMv8.2-A (aarch64) | ARMv9.2-A (aarch64) |
+| SoC | Broadcom BCM2712 | NVIDIA GB10 |
+| Physical cores | 4× Cortex-A76 @ 2.4 GHz | 10× Cortex-X925 @ 4.0 GHz + 10× Cortex-A725 @ 2.86 GHz |
+| L3 cache | 2 MiB shared | 24 MiB aggregate (16 MiB X925 + 8 MiB A725) |
+| DRAM | 8 GB LPDDR4X | 128 GB LPDDR5X |
+| Memory bandwidth | ~17 GB/s | ~273 GB/s |
 | Benchmark thread counts | 1, 2, 4, 8 | 1, 2, 4, 8, 16, 32, 64 |
 
 **On the RPi being "resource-constrained":**
 - The RPi 5 is actually quite capable by embedded standards — it runs a full Linux stack, has hardware-accelerated video, etc.
 - We use it as a proxy for the lower end of the ARM hardware spectrum: the quad-core limit and 2 MB L3 cache are structurally similar to what you find in wearable SoCs and edge compute modules.
-- The claim is not that the RPi _is_ a medical device; it's that its hardware profile (few cores, small cache) is representative of the constraints found in those domains.
-
-**Why same ISA matters for reproducibility:**
-- Nix flake pins `system = "aarch64-linux"` — same binary runs on both machines.
-- We set the CPU frequency governor to `performance` on both machines before each run to avoid clock throttling artifacts.
+- The claim is moreso that its hardware profile (few cores, small cache) is representative of the constraints found in industries that use _relatively_ resource-constrained hardware.
 
 ---
 
@@ -82,7 +80,7 @@ All striped variants partition the key space across **32 independent lock stripe
 
 **StripedMapPadded** — identical to `StripedMap`, but the `locks` and `sizes` arrays are allocated with a padding factor of 16 between entries (`locks = new Object[lockCount * 16]`, accessed as `locks[s * 16]`).
 - _Why padding?_ Without it, two adjacent lock objects may share a cache line (64 bytes). When one thread writes to one lock, the cache coherence protocol invalidates the entire line on every other core — including cores working on adjacent, _unrelated_ stripes. This is **false sharing**. The padding ensures no two stripes share a cache line, so a lock acquisition on stripe `s` does not evict lock data for stripe `s+1` from another core's L1 cache.
-- Effect is most visible at high thread counts on hardware with many cores.
+- The effect is most visible at high thread counts on many-core hardware. Here's why: at low thread counts (e.g., 2 threads on the RPi), the chance that two threads are simultaneously writing to locks that happen to share a cache line is small — there simply aren't enough concurrent writers to trigger the invalidation cascade frequently. As thread count grows, more cores are actively acquiring and releasing locks at the same time. On a 64-core machine, dozens of threads may be hammering neighboring stripes simultaneously, and if those lock objects are packed tightly in memory, each write ripples through the cache coherence bus as an invalidation broadcast to all other cores. Padding eliminates this by ensuring adjacent stripes land in different cache lines, so a write to stripe 0's lock never touches stripe 1's cache line at all.
 
 **StripedWriteMap** — immutable `ItemNode<K,V>` nodes (all fields `final`). Writes lock the stripe and build a new node list; reads do _not_ lock. Visibility of writes to readers is ensured through `AtomicIntegerArray sizes`: writes update the count even when size doesn't change, and reads load it before traversing the bucket chain. Because traversing an immutable linked list is safe without a lock (no half-completed nodes), read throughput is no longer gated by the write lock.
 
@@ -94,7 +92,7 @@ All striped variants partition the key space across **32 independent lock stripe
 
 **HashTrieMap** — a concurrent hash trie (Ctrie) based on Prokopec et al. (2011–2017). Uses `AtomicReferenceFieldUpdater` on `INode.main` for compare-and-swap (CAS) without `synchronized`. The trie has a configurable fan-out width (default 6 bits per level, giving 64 children per `CNode`). On a failed CAS, the operation restarts from scratch (the `RESTART` result type). Deletion uses tombstoning (`TNode`) to allow safe compaction. No locks anywhere; all mutations go through CAS loops.
 
-**WrapConcurrentHashMap** (WrapCHM) — a thin wrapper around Java's `java.util.concurrent.ConcurrentHashMap`. This is the JDK's battle-hardened, segment-based implementation with dynamic concurrency level, tree-ification of long buckets, and extensive JIT optimization. It is not a competitor we designed; it's the production baseline.
+**WrapConcurrentHashMap** (WrapCHM) — a thin wrapper around Java's `java.util.concurrent.ConcurrentHashMap`. This is the JDK's battle-hardened, segment-based implementation with dynamic concurrency level, tree-ification of long buckets, and extensive JIT optimization. It serves as the production baseline.
 
 ---
 
@@ -118,7 +116,7 @@ All striped variants partition the key space across **32 independent lock stripe
 
 **Key ranges — the cache boundary:**
 - **1,000 keys** — the working set fits inside the RPi's 2 MB L3 cache. Cache misses are rare; the bottleneck is lock contention or CAS retries. Both platforms keep the hot data warm.
-- **1,000,000 keys** — the working set exceeds the RPi's L3 cache (and approaches the limits of even the HPC's large cache under uniform access). Now memory latency and cache miss rates become the primary bottleneck, amplifying any algorithm that causes pointer chasing (e.g., tree traversal in HashTrieMap, long bucket chains).
+- **1,000,000 keys** — the working set exceeds the RPi's L3 cache (and stresses even the HPC's large cache under uniform access). Memory latency and cache miss rates become the dominant cost, and implementations that require following many pointers to complete a single operation — like HashTrieMap's INode → CNode → SNode traversal — pay a higher penalty per operation than flat-array structures that resolve a lookup in one or two memory accesses.
 
 **Distributions:**
 - **Uniform** — every key equally likely. Maximally spreads load across stripes.
@@ -126,8 +124,13 @@ All striped variants partition the key space across **32 independent lock stripe
 - **Zipfian-0.99** (heavy skew) — a small fraction of keys receives almost all traffic. Concentrates contention on a few stripes/buckets.
 
 **Pre-sampled key array:**
-- 1,000,000 keys are pre-sampled once in `@Setup(Level.Trial)` and stored in `int[] keys`. The benchmark hot path indexes into this array cyclically, keeping the sampling distribution out of the measurement loop and ensuring a non-trivial key distribution from the very first iteration (avoids warmup artifact from an empty map where all reads miss).
-- The map is pre-populated with ~50% of the key range at setup time for the same reason.
+- Before the benchmark starts, we draw 1 million keys from the chosen distribution and store them in an array. During the run, each thread steps through this array in order — no random number generation happening mid-measurement, just an array lookup. We also pre-fill the map with about half the key range before timing begins, so reads find real entries from the very first operation instead of hitting an empty map.
+
+**Why these specific choices?**
+
+_Why Zipfian distributions?_ Real workloads are rarely uniform. In web caches, databases, and key-value stores, a small fraction of keys absorbs a disproportionate share of traffic — the same pattern described by Zipf's law in word frequencies and Pareto's 80/20 rule in economics. We wanted to test whether our findings from uniform access hold when the workload is skewed, as it typically is in production. The two exponents cover a mild skew (0.5, like a reasonably popular cache entry) and a heavy one (0.99, like a viral item or a configuration value read millions of times per second).
+
+_Why these read ratios?_ Different applications sit at different points on the read/write spectrum. A lookup table or in-memory cache is mostly reads (0.8). A key-value store doing both reads and updates is roughly balanced (0.5). An ingestion pipeline writing new sensor readings is write-heavy (0.2). We include all three to see whether optimizations like lock-free reads in `StripedWriteMap` actually help where reads dominate, or whether they disappear under heavy write pressure.
 
 ### Slide 2: JMH — Why We Used It and How We Configured It
 
@@ -192,13 +195,13 @@ Two reinforcing mechanisms:
 
 **Why does it excel on HPC?**
 
-1. **Large cache absorbs the pointer-chasing cost.** The DGX Spark's ~114 MB L3 cache keeps most of the trie nodes resident. Cache miss rates drop dramatically, and the indirection cost disappears.
+1. **Larger cache and far higher memory bandwidth.** The DGX Spark has 24 MiB L3 (vs 2 MiB on RPi) and ~273 GB/s memory bandwidth (vs ~17 GB/s on RPi — a 16× difference). Hot trie nodes are more likely to stay in the larger L2/L3, and even on a cache miss the data arrives far faster. The pointer-chasing penalty per miss is much lower.
 
-2. **Many cores absorb GC cost.** With 72 cores, GC threads run on otherwise-idle cores and do not compete with benchmark threads. The JVM can collect aggressively in the background.
+2. **More cores absorb GC cost.** With 20 cores, GC threads can run on otherwise-idle cores and compete less with benchmark threads than they do on the RPi's 4-core setup. The JVM can collect more aggressively in the background.
 
-3. **Lock-free scalability.** At 64 threads, lock-based implementations face severe contention (threads queue for stripe locks). HashTrieMap's CAS loop means threads never block; they retry on conflict. With low cache miss rates, CAS retry rates are also low, and the lock-free design allows all 64 threads to make forward progress simultaneously.
+3. **Lock-free scalability.** At higher thread counts, lock-based implementations face growing contention (threads queue for stripe locks). HashTrieMap's CAS loop means threads never block; they retry on conflict instead of queuing. This matters most when many threads are active simultaneously.
 
-**Practical implication:** choosing HashTrieMap for a 4-core embedded device would give you near-worst performance. The same choice on a 64-core server gives you near-best. The algorithm is not universally good or bad — its goodness is hardware-dependent.
+**Practical implication:** choosing HashTrieMap for a 4-core embedded device would give you near-worst performance. The same choice on a 20-core server gives you near-best. The algorithm is not universally good or bad — its goodness is hardware-dependent.
 
 ### Slide 3: The Hardware Ceiling (Fig. 2 — Scalability)
 
@@ -229,7 +232,7 @@ Two reinforcing mechanisms:
 
 **1M key range (exceeds RPi L3 cache):**
 - **RPi:** skew _helps_. With 1M keys and only 4 threads, uniform access scatters reads across the full key space, generating frequent L3 cache misses. High Zipfian skew means most accesses go to a small set of hot keys that remain in L1/L2. Even with some lock contention, fewer cache misses outweighs the lock overhead at just 4 threads.
-- **HPC:** skew _hurts_. With a 114 MB L3 cache, the HPC keeps most of the 1M-key working set warm under uniform access anyway. High skew then creates thread contention on hot stripes without offering any cache benefit (the data was already cached). At 64 threads, the contention cost dominates.
+- **HPC:** skew _hurts_. With 24 MiB L3 and 273 GB/s memory bandwidth, the HPC resolves cache misses cheaply enough that uniform access across 1M keys is tolerable. High skew then adds thread contention on hot stripes without offering a meaningful cache benefit. At peak thread counts, the contention cost dominates.
 
 **Key insight:** the same workload characteristic (high key skew) has opposite effects on the two platforms. An optimization that targets high-skew workloads on one tier could actively harm performance on the other.
 
@@ -257,7 +260,7 @@ From our data, two concrete guidelines emerge:
 - Do not overengineer: you will saturate at the physical core count before algorithmic differences have room to matter.
 
 **For many-core servers with large caches (HPC/server profile):**
-- Use `WrapConcurrentHashMap` (industry-hardened) or `HashTrieMap` (excellent scaling beyond 32 threads). Both benefit from the large cache absorbing pointer-chasing costs, and from GC threads running on otherwise-idle cores.
+- Use `WrapConcurrentHashMap` (industry-hardened) or `HashTrieMap` (best scaling at high thread counts). Both benefit from the larger cache and higher memory bandwidth reducing pointer-chasing costs, and from GC threads competing less for CPU time on a 20-core machine.
 - The padded variants (`StripedMapPadded`, `StripedWriteMapPadded`) provide measurable benefit over their unpadded counterparts at high thread counts due to false-sharing reduction.
 
 ---
@@ -286,7 +289,7 @@ Devices at the true low end (e.g., BeagleBone Black: no L3 cache at all, single-
 
 Our findings point toward a clear design direction: the optimal implementation is hardware-dependent, and the decision criteria are knowable at runtime (number of logical processors, size of last-level cache).
 
-A hash map that queries `Runtime.getRuntime().availableProcessors()` and `java.lang.management.OperatingSystemMXBean` at startup, then selects the underlying implementation based on these values, would give application developers a single API that performs near-optimally on both a quad-core embedded board and a 72-core server — without requiring them to know the hardware in advance.
+A hash map that queries `Runtime.getRuntime().availableProcessors()` and `java.lang.management.OperatingSystemMXBean` at startup, then selects the underlying implementation based on these values, would give application developers a single API that performs near-optimally on both a quad-core embedded board and a 20-core server — without requiring them to know the hardware in advance.
 
 This is a natural thesis project extension of the current work.
 
